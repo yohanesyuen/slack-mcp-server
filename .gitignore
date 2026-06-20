@@ -6,4 +6,6 @@ installations/
 .slack-token
 .slack-user-id
 timestamps/
+artifacts/
 sandbox.ipynb
+.kiro/

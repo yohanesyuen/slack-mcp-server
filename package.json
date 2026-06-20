@@ -5,12 +5,16 @@
   "type": "module",
   "main": "mcp-server.js",
   "scripts": {
-    "start": "node mcp-server.js"
+    "start": "node mcp-server.js",
+    "clean": "rimraf timestamps"
   },
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "dotenv": "~17.4.2",
     "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "rimraf": "^5.0.10"
   }
 }

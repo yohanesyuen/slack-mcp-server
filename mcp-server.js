@@ -5,6 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import http from 'http';
 import crypto from 'crypto';
+import zlib from 'zlib';
 import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
 import 'dotenv/config';
@@ -164,9 +165,140 @@ function decodeTSR(tsr) {
 
 // --- End FreeTSA ---
 
+// --- Minimal ZIP writer (STORE+DEFLATE, no external deps) ---
+
+function dosDateTime(date) {
+  const dosTime = (date.getHours() << 11) | (date.getMinutes() << 5) | (date.getSeconds() >> 1);
+  const dosDate = ((date.getFullYear() - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+  return { dosTime, dosDate };
+}
+
+function buildZip(entries) {
+  const { dosTime, dosDate } = dosDateTime(new Date());
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+
+  for (const { name, data } of entries) {
+    const nameBuf = Buffer.from(name, 'utf-8');
+    const crc = zlib.crc32(data);
+    const compressed = zlib.deflateRawSync(data);
+
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0, 6);
+    localHeader.writeUInt16LE(8, 8);
+    localHeader.writeUInt16LE(dosTime, 10);
+    localHeader.writeUInt16LE(dosDate, 12);
+    localHeader.writeUInt32LE(crc, 14);
+    localHeader.writeUInt32LE(compressed.length, 18);
+    localHeader.writeUInt32LE(data.length, 22);
+    localHeader.writeUInt16LE(nameBuf.length, 26);
+    localHeader.writeUInt16LE(0, 28);
+    localParts.push(localHeader, nameBuf, compressed);
+
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0, 8);
+    centralHeader.writeUInt16LE(8, 10);
+    centralHeader.writeUInt16LE(dosTime, 12);
+    centralHeader.writeUInt16LE(dosDate, 14);
+    centralHeader.writeUInt32LE(crc, 16);
+    centralHeader.writeUInt32LE(compressed.length, 20);
+    centralHeader.writeUInt32LE(data.length, 24);
+    centralHeader.writeUInt16LE(nameBuf.length, 28);
+    centralHeader.writeUInt32LE(offset, 42);
+    centralParts.push(centralHeader, nameBuf);
+
+    offset += localHeader.length + nameBuf.length + compressed.length;
+  }
+
+  const localBuf = Buffer.concat(localParts);
+  const centralBuf = Buffer.concat(centralParts);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(centralBuf.length, 12);
+  eocd.writeUInt32LE(localBuf.length, 16);
+
+  return Buffer.concat([localBuf, centralBuf, eocd]);
+}
+
+// Zips + timestamps everything a call wrote to its callDir, keyed by the
+// sha256 of (filename, contents) pairs so identical call output is content-addressed.
+async function archiveCallDir(callDir) {
+  const names = fs.readdirSync(callDir).filter(f => fs.statSync(path.join(callDir, f)).isFile()).sort();
+  const entries = names.map(name => ({ name, data: fs.readFileSync(path.join(callDir, name)) }));
+
+  const hasher = crypto.createHash('sha256');
+  for (const { name, data } of entries) { hasher.update(name); hasher.update(data); }
+  const hash = hasher.digest('hex');
+
+  const artifactDir = path.join(__dirname, 'artifacts', hash);
+  fs.mkdirSync(artifactDir, { recursive: true });
+  const zipPath = path.join(artifactDir, `${hash}.zip`);
+  fs.writeFileSync(zipPath, buildZip(entries));
+
+  let timestamp;
+  try {
+    const result = await timestampData(fs.readFileSync(zipPath));
+    const tsqPath = path.join(artifactDir, `${hash}.tsq`);
+    const tsrPath = path.join(artifactDir, `${hash}.tsr`);
+    fs.writeFileSync(tsqPath, result.tsq);
+    fs.writeFileSync(tsrPath, result.tsr);
+    const { verified, output } = verifyTimestamp(tsqPath, tsrPath);
+    timestamp = {
+      success: true,
+      hash: result.hash,
+      verified,
+      verify_output: output,
+      zip_url: `http://localhost:${PORT}/artifacts/${hash}/${hash}.zip`,
+      verification_instructions: `To independently verify this archive, download the following files:\n` +
+        `1. http://localhost:${PORT}/artifacts/${hash}/${hash}.zip\n` +
+        `2. http://localhost:${PORT}/artifacts/${hash}/${hash}.tsr\n` +
+        `3. http://localhost:${PORT}/artifacts/${hash}/${hash}.tsq\n` +
+        `4. http://localhost:${PORT}/certs/cacert.pem\n` +
+        `5. http://localhost:${PORT}/certs/tsa.crt\n\n` +
+        `Then run: openssl ts -verify -in ${hash}.tsr -queryfile ${hash}.tsq -CAfile cacert.pem -untrusted tsa.crt\n` +
+        `To confirm the .zip matches the hash: openssl dgst -sha512 ${hash}.zip`,
+    };
+  } catch (err) {
+    timestamp = { success: false, error: err.message };
+  }
+
+  return { hash, zipPath, timestamp };
+}
+
+// --- End ZIP writer ---
+
 function getSelfHash() {
   const src = fs.readFileSync(path.join(__dirname, 'mcp-server.js'));
   return crypto.createHash('sha256').update(src).digest('hex');
+}
+
+function getGitCommit() {
+  try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: __dirname, encoding: 'utf-8' }).trim(); }
+  catch { return null; }
+}
+
+function getGitMasterCommit() {
+  try { return execFileSync('git', ['rev-parse', 'origin/master'], { cwd: __dirname, encoding: 'utf-8' }).trim(); }
+  catch { return null; }
+}
+
+const GIT_REPO_URL = 'https://github.com/yohanesyuen/slack-mcp-server';
+
+// Accepts an ISO 8601 date or a Slack ts (seconds[.micros]) and returns a Slack ts string.
+function toSlackTs(value) {
+  if (!value) return undefined;
+  if (/^\d+(\.\d+)?$/.test(value)) return value;
+  const ms = Date.parse(value);
+  if (Number.isNaN(ms)) throw new Error(`Invalid date: ${value}`);
+  return (ms / 1000).toFixed(6);
 }
 
 async function slackApi(method, body = {}, { callDir } = {}) {
@@ -187,6 +319,9 @@ async function slackApi(method, body = {}, { callDir } = {}) {
     request: { method: 'POST', url, headers: Object.fromEntries(Object.entries(requestHeaders).filter(([k]) => k.toLowerCase() !== 'authorization')), body },
     response: { status: res.status, headers: responseHeaders, body: rawBody },
     mcp_server_sha256: getSelfHash(),
+    git_commit: getGitCommit(),
+    git_master_commit: getGitMasterCommit(),
+    git_repo_url: GIT_REPO_URL,
     captured_at: new Date().toISOString(),
   };
 
@@ -225,7 +360,9 @@ async function slackApi(method, body = {}, { callDir } = {}) {
         `4. http://localhost:${PORT}/certs/cacert.pem\n` +
         `5. http://localhost:${PORT}/certs/tsa.crt\n\n` +
         `Then run: openssl ts -verify -in ${filename}.tsr -queryfile ${filename}.tsq -CAfile cacert.pem -untrusted tsa.crt\n` +
-        `To confirm the .json file matches the hash: openssl dgst -sha512 ${filename}.json`,
+        `To confirm the .json file matches the hash: openssl dgst -sha512 ${filename}.json\n\n` +
+        (getGitCommit() ? `Server source (current): ${GIT_REPO_URL}/tree/${getGitCommit()}\n` : '') +
+        (getGitMasterCommit() ? `Server source (master): ${GIT_REPO_URL}/tree/${getGitMasterCommit()}` : ''),
     };
   } catch (err) {
     console.error('Timestamp failed:', err.message);
@@ -244,6 +381,7 @@ const TEMPLATES_DIR = path.join(__dirname, 'templates');
 const MESSAGE_TEMPLATE = fs.readFileSync(path.join(TEMPLATES_DIR, 'message.md'), 'utf-8');
 const HISTORY_HEADER_TEMPLATE = fs.readFileSync(path.join(TEMPLATES_DIR, 'history-header.md'), 'utf-8');
 const HISTORY_FOOTER_TEMPLATE = fs.readFileSync(path.join(TEMPLATES_DIR, 'history-footer.md'), 'utf-8');
+const ARCHIVE_TEMPLATE = fs.readFileSync(path.join(TEMPLATES_DIR, 'archive.md'), 'utf-8');
 
 function renderTemplate(template, vars) {
   return template.replace(/\{\{(\w+)\}\}/g, (_, key) => vars[key] ?? '');
@@ -287,20 +425,25 @@ async function messagesToMarkdown(messages, channel) {
 }
 
 function historyHeader(count, pages, { channel, duration } = {}) {
-  return renderTemplate(HISTORY_HEADER_TEMPLATE, { count, pages, channel: channel || '', duration: duration || '', sha256: getSelfHash() });
+  return renderTemplate(HISTORY_HEADER_TEMPLATE, { count, pages, channel: channel || '', duration: duration || '', sha256: getSelfHash(), git_commit: getGitCommit() || '', git_master_commit: getGitMasterCommit() || '', git_repo_url: GIT_REPO_URL });
 }
 
 function historyFooter(count, pages, { channel, timestamp_links, duration, has_more } = {}) {
-  return renderTemplate(HISTORY_FOOTER_TEMPLATE, { count, pages, channel: channel || '', timestamp_links: timestamp_links || '', duration: duration || '', has_more: has_more ? 'true' : '', sha256: getSelfHash() });
+  return renderTemplate(HISTORY_FOOTER_TEMPLATE, { count, pages, channel: channel || '', timestamp_links: timestamp_links || '', duration: duration || '', has_more: has_more ? 'true' : '', sha256: getSelfHash(), git_commit: getGitCommit() || '', git_master_commit: getGitMasterCommit() || '', git_repo_url: GIT_REPO_URL });
 }
 
-function runFullHistoryJob(jobId, channel, pageSize) {
+function archiveSection(archive) {
+  if (!archive.timestamp.success) return `## Archive\n\n_Archiving failed: ${archive.timestamp.error}_`;
+  return renderTemplate(ARCHIVE_TEMPLATE, { hash: archive.hash, zip_url: archive.timestamp.zip_url, verification_instructions: archive.timestamp.verification_instructions });
+}
+
+function runFullHistoryJob(jobId, channel, pageSize, oldest, latest) {
   const job = jobs.get(jobId);
   (async () => {
     let cursor;
     try {
       do {
-        const { data, timestamp } = await slackApi('conversations.history', { channel, limit: pageSize, cursor }, { callDir: job.callDir });
+        const { data, timestamp } = await slackApi('conversations.history', { channel, limit: pageSize, cursor, oldest, latest }, { callDir: job.callDir });
         if (data.error) throw new Error(data.error);
         job.messages.push(...(data.messages || []).map(m => ({ user: m.user, text: m.text, ts: m.ts, thread_ts: m.thread_ts, subtype: m.subtype, edited: m.edited, reactions: m.reactions, files: m.files, reply_count: m.reply_count, team: m.team })));
         job.timestamps.push(timestamp);
@@ -354,14 +497,18 @@ function createServer() {
   server.tool('get_full_history', 'Fetch the entire message history of a channel by paginating until exhausted, returning everything in one response as markdown', {
     channel: z.string().describe('Channel ID'),
     page_size: z.number().optional().default(1000).describe('Messages per page (Slack max: 1000)'),
-  }, async ({ channel, page_size }) => {
+    earliest: z.string().optional().describe('Stop fetching messages older than this date (ISO 8601 or Slack ts). Maps to Slack\'s "oldest" param.'),
+    latest: z.string().optional().describe('Only fetch messages at or before this date (ISO 8601 or Slack ts).'),
+  }, async ({ channel, page_size, earliest, latest }) => {
+    const oldest = toSlackTs(earliest);
+    const latestTs = toSlackTs(latest);
     const callDir = makeCallDir();
     const messages = [];
     const timestamps = [];
     let cursor;
     const startTime = Date.now();
     do {
-      const { data, timestamp } = await slackApi('conversations.history', { channel, limit: page_size, cursor }, { callDir });
+      const { data, timestamp } = await slackApi('conversations.history', { channel, limit: page_size, cursor, oldest, latest: latestTs }, { callDir });
       if (data.error) return { content: [{ type: 'text', text: JSON.stringify({ error: data.error, timestamp }, null, 2) }] };
       messages.push(...(data.messages || []).map(m => ({ user: m.user, text: m.text, ts: m.ts, thread_ts: m.thread_ts, subtype: m.subtype, edited: m.edited, reactions: m.reactions, files: m.files, reply_count: m.reply_count, team: m.team })));
       timestamps.push(timestamp);
@@ -371,17 +518,20 @@ function createServer() {
     const timestamp_links = timestamps.filter(t => t.success).map(t => t.verification_instructions).join('\n');
     const md = `${historyHeader(messages.length, timestamps.length, { channel, duration })}\n\n${await messagesToMarkdown(messages, channel)}\n\n${historyFooter(messages.length, timestamps.length, { channel, timestamp_links, duration, has_more: false })}`;
     fs.writeFileSync(path.join(callDir, `history.md`), md);
-    return { content: [{ type: 'text', text: md }] };
+    const archive = await archiveCallDir(callDir);
+    return { content: [{ type: 'text', text: `${md}\n\n${archiveSection(archive)}` }] };
   });
 
   server.tool('start_full_history_fetch', 'Start a non-blocking background fetch of a channel\'s entire message history. Returns a job_id immediately; poll it with get_full_history_status', {
     channel: z.string().describe('Channel ID'),
     page_size: z.number().optional().default(1000).describe('Messages per page (Slack max: 1000)'),
-  }, async ({ channel, page_size }) => {
+    earliest: z.string().optional().describe('Stop fetching messages older than this date (ISO 8601 or Slack ts). Maps to Slack\'s "oldest" param.'),
+    latest: z.string().optional().describe('Only fetch messages at or before this date (ISO 8601 or Slack ts).'),
+  }, async ({ channel, page_size, earliest, latest }) => {
     const jobId = crypto.randomUUID();
     const callDir = makeCallDir();
     jobs.set(jobId, { status: 'running', channel, callDir, messages: [], timestamps: [], pages_fetched: 0, error: null, started_at: new Date().toISOString(), finished_at: null });
-    runFullHistoryJob(jobId, channel, page_size);
+    runFullHistoryJob(jobId, channel, page_size, toSlackTs(earliest), toSlackTs(latest));
     return { content: [{ type: 'text', text: JSON.stringify({ job_id: jobId, status: 'started' }, null, 2) }] };
   });
 
@@ -397,7 +547,8 @@ function createServer() {
     const header = `${JSON.stringify(summary, null, 2)}\n\n${historyHeader(job.messages.length, job.pages_fetched, { channel: job.channel, duration })}`;
     const md = `${header}\n\n${await messagesToMarkdown(job.messages, job.channel)}`;
     fs.writeFileSync(path.join(job.callDir, `history.md`), md);
-    return { content: [{ type: 'text', text: md }] };
+    if (!job.archive) job.archive = await archiveCallDir(job.callDir);
+    return { content: [{ type: 'text', text: `${md}\n\n${archiveSection(job.archive)}` }] };
   });
 
   server.tool('reply_to_thread', 'Reply to a message thread', {
@@ -500,26 +651,24 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // Serve timestamp files
-  if (url.pathname.startsWith('/timestamps/')) {
-    const filePath = path.join(__dirname, decodeURIComponent(url.pathname));
+  // Serve static download dirs (timestamps/certs/artifacts), confined to their own base dir
+  for (const route of ['/timestamps/', '/certs/', '/artifacts/']) {
+    if (!url.pathname.startsWith(route)) continue;
+    const baseDir = path.join(__dirname, route.slice(1, -1));
+    const filePath = path.resolve(baseDir, '.' + decodeURIComponent(url.pathname).slice(route.length - 1));
+    if (!filePath.startsWith(baseDir + path.sep)) {
+      res.writeHead(403);
+      res.end('Forbidden');
+      return;
+    }
     if (fs.existsSync(filePath) && !fs.statSync(filePath).isDirectory()) {
       const ext = path.extname(filePath);
-      const mime = { '.json': 'application/json', '.tsr': 'application/timestamp-reply', '.tsq': 'application/timestamp-query', '.pem': 'application/x-pem-file', '.crt': 'application/x-x509-ca-cert' }[ext] || 'application/octet-stream';
+      const mime = { '.json': 'application/json', '.tsr': 'application/timestamp-reply', '.tsq': 'application/timestamp-query', '.pem': 'application/x-pem-file', '.crt': 'application/x-x509-ca-cert', '.zip': 'application/zip' }[ext] || 'application/octet-stream';
       res.writeHead(200, { 'Content-Type': mime, 'Content-Disposition': `attachment; filename="${path.basename(filePath)}"` });
       fs.createReadStream(filePath).pipe(res);
       return;
     }
-  }
-
-  // Serve cert files for verification
-  if (url.pathname.startsWith('/certs/')) {
-    const filePath = path.join(__dirname, decodeURIComponent(url.pathname));
-    if (fs.existsSync(filePath) && !fs.statSync(filePath).isDirectory()) {
-      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="${path.basename(filePath)}"` });
-      fs.createReadStream(filePath).pipe(res);
-      return;
-    }
+    break;
   }
 
   res.writeHead(404);
