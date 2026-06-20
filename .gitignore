@@ -1,0 +1,9 @@
+node_modules
+.DS_Store
+.env*
+!.env.sample
+installations/
+.slack-token
+.slack-user-id
+timestamps/
+sandbox.ipynb

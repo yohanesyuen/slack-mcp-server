@@ -1,0 +1,16 @@
+{
+  "name": "slack-mcp-server",
+  "version": "1.0.0",
+  "description": "Local MCP server exposing Slack tools, with FreeTSA-verified (RFC 3161) request/response timestamping",
+  "type": "module",
+  "main": "mcp-server.js",
+  "scripts": {
+    "start": "node mcp-server.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "dotenv": "~17.4.2",
+    "zod": "^3.25.0"
+  }
+}
