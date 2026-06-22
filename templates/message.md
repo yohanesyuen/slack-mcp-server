@@ -1,1 +1,1 @@
-- **{{user}}** (`{{ts}}`): {{text}}
+- **{{user}}** ({{ts}}){{edited}}{{subtype}}: {{text}}{{reactions}}{{files}}{{reply_count}}

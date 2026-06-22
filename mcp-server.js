@@ -407,6 +407,8 @@ function formatTs(ts) {
 async function messagesToMarkdown(messages, channel) {
   const userIds = [...new Set(messages.map(m => m.user).filter(Boolean))];
   await Promise.all(userIds.map(resolveUserName));
+  const extractedAt = new Date().toLocaleString('en-SG', { timeZone: 'Asia/Singapore', year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) + ' SGT';
+  const serverHash = getSelfHash();
   return messages
     .map(m => renderTemplate(MESSAGE_TEMPLATE, {
       user: userNameCache.get(m.user) || m.user,
@@ -414,12 +416,14 @@ async function messagesToMarkdown(messages, channel) {
       text: (m.text || '').replace(/\n/g, ' '),
       channel: channel || '',
       thread_ts: formatTs(m.thread_ts),
-      subtype: m.subtype || '',
-      edited: m.edited ? 'true' : '',
-      reactions: (m.reactions || []).map(r => `:${r.name}:×${r.count}`).join(' ') || '',
-      files: (m.files || []).length ? `${m.files.length} file(s)` : '',
-      reply_count: m.reply_count != null ? String(m.reply_count) : '',
+      subtype: m.subtype ? ` [${m.subtype}]` : '',
+      edited: m.edited ? ' ✏️' : '',
+      reactions: (m.reactions || []).map(r => `:${r.name}:×${r.count}`).join(' ') ? ` | ${(m.reactions || []).map(r => `:${r.name}:×${r.count}`).join(' ')}` : '',
+      files: (m.files || []).length ? ` | 📎 ${m.files.length} file(s)` : '',
+      reply_count: m.reply_count != null ? ` | 💬 ${m.reply_count} replies` : '',
       team: m.team || '',
+      extracted_at: extractedAt,
+      server_hash: serverHash,
     }))
     .join('\n');
 }
@@ -520,6 +524,137 @@ function createServer() {
     fs.writeFileSync(path.join(callDir, `history.md`), md);
     const archive = await archiveCallDir(callDir);
     return { content: [{ type: 'text', text: `${md}\n\n${archiveSection(archive)}` }] };
+  });
+
+  server.tool('batch_full_history', 'Fetch full history for multiple channels and combine all artifacts into a single zip under /artifacts/{sha256}.zip', {
+    channels: z.array(z.object({ id: z.string(), label: z.string().optional() })).describe('Array of {id, label} channel objects to fetch'),
+    page_size: z.number().optional().default(1000).describe('Messages per page (Slack max: 1000)'),
+    earliest: z.string().optional().describe('Stop fetching messages older than this date (ISO 8601 or Slack ts)'),
+    latest: z.string().optional().describe('Only fetch messages at or before this date (ISO 8601 or Slack ts)'),
+  }, async ({ channels, page_size, earliest, latest }) => {
+    const oldest = toSlackTs(earliest);
+    const latestTs = toSlackTs(latest);
+    const startTime = Date.now();
+    const allEntries = [];
+    const results = [];
+    const indexData = [];
+
+    for (const { id: channel, label } of channels) {
+      const callDir = makeCallDir();
+      const messages = [];
+      let cursor;
+      try {
+        do {
+          const { data } = await slackApi('conversations.history', { channel, limit: page_size, cursor, oldest, latest: latestTs }, { callDir });
+          if (data.error) { results.push({ channel, label, error: data.error }); break; }
+          messages.push(...(data.messages || []).map(m => ({ user: m.user, text: m.text, ts: m.ts, thread_ts: m.thread_ts, subtype: m.subtype, edited: m.edited, reactions: m.reactions, files: m.files, reply_count: m.reply_count, team: m.team })));
+          cursor = data.has_more ? data.response_metadata?.next_cursor : undefined;
+        } while (cursor);
+        if (!results.find(r => r.channel === channel)) {
+          const md = `${historyHeader(messages.length, 0, { channel })}\n\n${await messagesToMarkdown(messages, channel)}`;
+          fs.writeFileSync(path.join(callDir, 'history.md'), md);
+          const archive = await archiveCallDir(callDir);
+          // Add all files from the artifact dir into the consolidated zip under {hash}/
+          const artifactDir = path.join(__dirname, 'artifacts', archive.hash);
+          const files = fs.readdirSync(artifactDir);
+          for (const f of files) {
+            allEntries.push({ name: `${archive.hash}/${f}`, data: fs.readFileSync(path.join(artifactDir, f)) });
+          }
+          indexData.push({ channelName: label || channel, file: `${archive.hash}/${archive.hash}.zip`, md });
+          results.push({ channel, label, messages: messages.length, artifact: archive.hash });
+        }
+      } catch (err) {
+        results.push({ channel, label, error: err.message });
+      }
+    }
+
+    // Add index.json (without md content)
+    allEntries.push({ name: 'index.json', data: Buffer.from(JSON.stringify(indexData.map(c => ({ channelName: c.channelName, file: c.file })), null, 2), 'utf-8') });
+
+    // Add self-contained index.html with all markdown inlined + marked.js bundled via CDN fallback
+    // Embed conversations as a JS object so no fetch/unzip needed - works from file://
+    const conversations = indexData.map(c => ({ channelName: c.channelName, md: c.md }));
+    const indexHtml = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Slack DM Archive</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#1a1a2e;color:#e0e0e0;min-height:100vh;padding:2rem;display:flex;flex-direction:column;align-items:center}
+h1{margin-bottom:1.5rem;color:#fff}
+.list{width:100%;max-width:500px}
+.item{display:block;padding:1rem 1.5rem;margin:.5rem 0;background:#16213e;border-radius:8px;color:#e0e0e0;text-decoration:none;transition:background .2s;cursor:pointer}
+.item:hover{background:#0f3460}
+#content{width:100%;max-width:900px;display:none}
+#back{cursor:pointer;color:#4fc3f7;margin-bottom:1rem;display:inline-block}
+#md{background:#16213e;padding:2rem;border-radius:8px;line-height:1.6;overflow-wrap:break-word}
+#md h1,#md h2,#md h3{color:#fff;margin:1rem 0 .5rem}
+#md p{margin:.5rem 0}
+#md ul,#md ol{padding-left:1.5rem;margin:.5rem 0}
+#md code{background:#0f3460;padding:.2rem .4rem;border-radius:3px}
+#md pre{background:#0f3460;padding:1rem;border-radius:6px;overflow-x:auto;margin:.5rem 0}
+#md strong{color:#fff}
+</style></head><body>
+<div id="main"><h1>Conversation Archive</h1><div class="list" id="list"></div></div>
+<div id="content"><a id="back">&larr; Back</a><div id="md"></div></div>
+<script>
+var convos=${JSON.stringify(conversations).replace(/<\//g,'<\\/')};
+var el=document.getElementById('list');
+var mainEl=document.getElementById('main');
+var contentEl=document.getElementById('content');
+var mdEl=document.getElementById('md');
+
+convos.forEach(function(c,i){
+  var a=document.createElement('div');
+  a.className='item';
+  a.textContent=c.channelName;
+  a.onclick=function(){show(i);};
+  el.appendChild(a);
+});
+
+document.getElementById('back').onclick=function(){
+  contentEl.style.display='none';
+  mainEl.style.display='flex';
+  mainEl.style.flexDirection='column';
+  mainEl.style.alignItems='center';
+};
+
+function show(i){
+  mainEl.style.display='none';
+  var html=typeof marked!=='undefined'?marked.parse(convos[i].md):convos[i].md.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\\n/g,'<br>');
+  mdEl.innerHTML=html;
+  contentEl.style.display='block';
+  window.scrollTo(0,0);
+}
+<\/script>
+<script src="https://cdn.jsdelivr.net/npm/marked@15.0.4/marked.min.js" onload=""><\/script>
+</body></html>`;
+    allEntries.push({ name: 'index.html', data: Buffer.from(indexHtml, 'utf-8') });
+
+    // Build consolidated zip and place under artifacts/{sha256}.zip
+    const zipBuf = buildZip(allEntries);
+    const hash = crypto.createHash('sha256').update(zipBuf).digest('hex');
+    const consolidatedDir = path.join(__dirname, 'artifacts', hash);
+    fs.mkdirSync(consolidatedDir, { recursive: true });
+    const zipPath = path.join(consolidatedDir, `${hash}.zip`);
+    fs.writeFileSync(zipPath, zipBuf);
+
+    let timestamp;
+    try {
+      const tsResult = await timestampData(fs.readFileSync(zipPath));
+      const tsqPath = path.join(consolidatedDir, `${hash}.tsq`);
+      const tsrPath = path.join(consolidatedDir, `${hash}.tsr`);
+      fs.writeFileSync(tsqPath, tsResult.tsq);
+      fs.writeFileSync(tsrPath, tsResult.tsr);
+      const { verified, output } = verifyTimestamp(tsqPath, tsrPath);
+      timestamp = { success: true, hash: tsResult.hash, verified, verify_output: output };
+    } catch (err) {
+      timestamp = { success: false, error: err.message };
+    }
+
+    const duration = `${((Date.now() - startTime) / 1000).toFixed(1)}s`;
+    const zip_url = `http://localhost:${PORT}/artifacts/${hash}/${hash}.zip`;
+    const summary = { results, duration, zip_url, sha256: hash, timestamp };
+    return { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] };
   });
 
   server.tool('start_full_history_fetch', 'Start a non-blocking background fetch of a channel\'s entire message history. Returns a job_id immediately; poll it with get_full_history_status', {
